@@ -1,0 +1,52 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guac-visualizer
+  namespace: trusted-supply-chain
+  labels:
+    app: guac-visualizer
+    app.kubernetes.io/part-of: trusted-supply-chain
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: guac-visualizer
+  template:
+    metadata:
+      labels:
+        app: guac-visualizer
+    spec:
+      containers:
+        - name: visualizer
+          image: ghcr.io/guacsec/guac-visualizer:v0.6.4
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: GUAC_GQL_ADDR
+              value: "http://guac-graphql:8080/query"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guac-visualizer
+  namespace: trusted-supply-chain
+  labels:
+    app: guac-visualizer
+spec:
+  selector:
+    app: guac-visualizer
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30080
+      name: http
+  type: NodePort

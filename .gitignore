@@ -1,6 +1,9 @@
 # Keys — NEVER commit private keys
 .keys/
 
+# Credentials
+.env
+
 # Java / Maven
 quarkus-app/target/
 *.class
@@ -24,3 +27,4 @@ Thumbs.db
 
 # Test output
 .test-output/
+*.bak
