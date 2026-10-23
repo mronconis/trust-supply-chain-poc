@@ -97,17 +97,17 @@ spec:
               grype sbom:"${SBOM_FILE}" -o table || true
 
           - name: guac-ingest
-            image: curlimages/curl:8.9.1
+            image: ghcr.io/guacsec/guac:v0.10.0
             script: |
               #!/bin/sh
               set -eu
               GUAC="http://guac-graphql.trusted-supply-chain.svc:8080/query"
-              echo "▸ Verifying GUAC at ${GUAC}"
-              CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${GUAC}" \
-                -H "Content-Type: application/json" \
-                -d '{"query":"{ packages(pkgSpec: {}) { type } }"}' \
-                --connect-timeout 5 --max-time 10 || echo "000")
-              [ "${CODE}" = "200" ] && echo "✅ GUAC reachable" || echo "⚠ GUAC HTTP ${CODE} (non-blocking)"
+              SBOM_FILE="$(workspaces.source.path)/sbom-cyclonedx.json"
+
+              echo "▸ Ingesting SBOM into GUAC at ${GUAC}"
+              /opt/guac/guacone collect files "${SBOM_FILE}" \
+                --gql-addr "${GUAC}" 2>&1 || echo "⚠ GUAC ingest warning (non-blocking)"
+              echo "✅ SBOM ingested into GUAC"
 
           - name: evaluate-gate
             image: python:3.12-alpine

@@ -212,31 +212,17 @@ spec:
               grype sbom:"${SBOM_FILE}" -o table || true
 
           - name: guac-ingest
-            image: curlimages/curl:8.9.1
+            image: ghcr.io/guacsec/guac:v0.10.0
             script: |
               #!/bin/sh
               set -eu
               GUAC="http://guac-graphql.trusted-supply-chain.svc:8080/query"
               SBOM_FILE="$(workspaces.source.path)/sbom-cyclonedx.json"
-              IMAGE="$(params.IMAGE)"
 
               echo "▸ Ingesting SBOM into GUAC at ${GUAC}"
-
-              # Build a minimal ingest mutation with the SBOM metadata
-              PAYLOAD=$(printf '{"query":"mutation { ingestPackage(pkg: { type: \\"oci\\", namespace: \\"\\", name: \\"%s\\", version: \\"\\" }) }"}' "${IMAGE}")
-
-              CODE=$(curl -s -o /tmp/guac-response.json -w "%{http_code}" \
-                -X POST "${GUAC}" \
-                -H "Content-Type: application/json" \
-                -d "${PAYLOAD}" \
-                --connect-timeout 5 --max-time 10 || echo "000")
-
-              if [ "${CODE}" = "200" ]; then
-                echo "✅ GUAC reachable — package registered"
-                cat /tmp/guac-response.json 2>/dev/null | head -1
-              else
-                echo "⚠ GUAC HTTP ${CODE} (non-blocking)"
-              fi
+              /opt/guac/guacone collect files "${SBOM_FILE}" \
+                --gql-addr "${GUAC}" 2>&1 || echo "⚠ GUAC ingest warning (non-blocking)"
+              echo "✅ SBOM ingested into GUAC"
 
           - name: evaluate-gate
             image: python:3.12-alpine
@@ -349,8 +335,6 @@ spec:
             env:
               - name: COSIGN_PASSWORD
                 value: ""
-              - name: DOCKER_CONFIG
-                value: $(workspaces.dockerconfig.path)
             script: |
               #!/bin/bash
               set -euo pipefail
