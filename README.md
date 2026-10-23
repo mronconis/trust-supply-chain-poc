@@ -61,10 +61,9 @@ trust-supply-chain-poc/
 ├── security/
 │   └── cve-allowlist.json                # Accepted CVEs (base-image, transitive)
 └── scripts/
-    ├── 01-bootstrap-cluster.sh           # Create cluster, install Tekton + GUAC
-    ├── 02-setup-credentials.sh           # Generate Cosign keypair, create K8s secrets
-    ├── 03-run-pipeline.sh                # Launch pipeline (tkn or kubectl)
-    ├── 04-verify.sh                      # Verify image signature post-pipeline
+    ├── 01-bootstrap-cluster.sh           # Create cluster, install Tekton + GUAC + credentials
+    ├── 02-run-pipeline.sh                # Launch pipeline (tkn or kubectl)
+    ├── 03-verify.sh                      # Verify image signature post-pipeline
     ├── demo.sh                           # Interactive demo: fail → fix → pass → verify
     └── cleanup.sh                        # Tear down cluster and keys
 ```
@@ -109,6 +108,12 @@ This script:
 - Deploys GUAC with an in-memory `keyvalue` backend.
 - Deploys the GUAC Visualizer (dependency graph UI).
 - Applies all Tekton Tasks and Pipelines.
+- Generates a **Cosign static keypair** (no passphrase) under `.keys/`.
+- Creates the `cosign-keys` Kubernetes Secret.
+- Creates the `quay-registry-secret` docker-registry Secret (reads from `.env`).
+- Creates the `cve-allowlist` ConfigMap.
+
+> **Security note**: `.keys/` is git-ignored. Never commit private keys.
 
 Verify:
 
@@ -118,19 +123,19 @@ kubectl get pods -n trusted-supply-chain      # guac-graphql + guac-collectsub +
 kubectl get pipelines -n trusted-supply-chain # trusted-supply-chain-quay, test-trust-chain
 ```
 
-### 2. Configure credentials and keys
 
-```bash
-./scripts/02-setup-credentials.sh
-```
 
-This script:
-- Generates a **Cosign static keypair** (no passphrase) under `.keys/`.
-- Creates the `cosign-keys` Kubernetes Secret.
-- Creates the `quay-registry-secret` docker-registry Secret (reads from `.env`).
-- Creates the `cve-allowlist` ConfigMap.
 
-> **Security note**: `.keys/` is git-ignored. Never commit private keys.
+
+
+
+
+
+
+
+
+
+
 
 ### 3. Access the GUAC Visualizer
 
@@ -152,6 +157,8 @@ The demo script (`scripts/demo.sh`) executes the full use case interactively. It
 ```bash
 ./scripts/demo.sh
 ```
+
+> **Note**: The demo script now runs the bootstrap and credential setup automatically, so there's no need to run `./scripts/01-bootstrap-cluster.sh` or `./scripts/02-setup-credentials.sh` separately.
 
 ### Phase 1 — Show the vulnerable dependency
 
