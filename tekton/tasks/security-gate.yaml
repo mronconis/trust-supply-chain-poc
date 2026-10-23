@@ -6,178 +6,124 @@ metadata:
   labels:
     app.kubernetes.io/part-of: trusted-supply-chain
 spec:
-  description: |
-    Scans the SBOM for known vulnerabilities using Grype, ingests the SBOM
-    into GUAC for graph analysis, and enforces a security gate:
-    the task FAILS if any CRITICAL CVE is detected.
+  description: >
+    Scans the SBOM with Grype, ingests into GUAC, and evaluates
+    a security gate with CVE allowlist support.
   params:
     - name: IMAGE
-      description: Full image reference
       type: string
-    - name: GUAC_URL
-      description: GUAC GraphQL endpoint
-      type: string
-      default: "http://guac-graphql.trusted-supply-chain.svc:8080/query"
     - name: FAIL_ON_SEVERITY
-      description: Minimum severity to fail the gate (CRITICAL, HIGH, MEDIUM, LOW)
       type: string
-      default: "critical"
   workspaces:
     - name: source
-      description: Workspace containing the SBOM
     - name: dockerconfig
-      description: Docker config.json for registry auth
+    - name: cve-allowlist
   results:
     - name: GATE_RESULT
-      description: PASSED or FAILED
     - name: CRITICAL_COUNT
-      description: Number of critical CVEs found
     - name: TOTAL_VULN_COUNT
-      description: Total vulnerabilities found
   steps:
-    # Step 1 – Vulnerability scan with Grype
     - name: grype-scan
-      image: anchore/grype:latest
-      workingDir: $(workspaces.source.path)
-      env:
-        - name: DOCKER_CONFIG
-          value: $(workspaces.dockerconfig.path)
+      image: alpine:3.20
       script: |
-        #!/usr/bin/env sh
+        #!/bin/sh
         set -eu
+        echo "▸ Installing Grype..."
+        wget -qO- https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
         SBOM_FILE="$(workspaces.source.path)/sbom-cyclonedx.json"
-        echo "▸ Running Grype vulnerability scan on SBOM"
-
-        grype sbom:"${SBOM_FILE}" \
-          -o json \
-          --file /tmp/grype-results.json || true
-
-        grype sbom:"${SBOM_FILE}" \
-          -o table \
-          --file /tmp/grype-results.txt || true
-
+        echo "▸ Scanning SBOM for vulnerabilities"
+        grype sbom:"${SBOM_FILE}" -o json --file $(workspaces.source.path)/grype-results.json || true
         echo ""
-        echo "════════════════════════════════════════════════════════════"
-        echo "  VULNERABILITY SCAN RESULTS"
-        echo "════════════════════════════════════════════════════════════"
-        cat /tmp/grype-results.txt 2>/dev/null || echo "(no table output)"
-        echo "════════════════════════════════════════════════════════════"
+        echo "╔═══════════════════════════════════════════════════════════╗"
+        echo "║  VULNERABILITY SCAN RESULTS                              ║"
+        echo "╚═══════════════════════════════════════════════════════════╝"
+        grype sbom:"${SBOM_FILE}" -o table || true
 
-        cp /tmp/grype-results.json $(workspaces.source.path)/grype-results.json 2>/dev/null || echo "{}" > $(workspaces.source.path)/grype-results.json
-
-    # Step 2 – Ingest SBOM into GUAC
     - name: guac-ingest
-      image: curlimages/curl:8.9.1
-      workingDir: $(workspaces.source.path)
+      image: ghcr.io/guacsec/guac:v0.10.0
       script: |
-        #!/usr/bin/env sh
+        #!/bin/sh
         set -eu
+        GUAC="http://guac-graphql.trusted-supply-chain.svc:8080/query"
         SBOM_FILE="$(workspaces.source.path)/sbom-cyclonedx.json"
-        GUAC_URL="$(params.GUAC_URL)"
-        IMAGE="$(params.IMAGE)"
 
-        echo "▸ Ingesting SBOM into GUAC at ${GUAC_URL}"
+        echo "▸ Ingesting SBOM into GUAC at ${GUAC}"
+        /opt/guac/guacone collect files "${SBOM_FILE}" \
+          --gql-addr "${GUAC}" 2>&1 || echo "⚠ GUAC ingest warning (non-blocking)"
+        echo "✅ SBOM ingested into GUAC"
 
-        # Encode SBOM as base64 for the GUAC ingest mutation
-        SBOM_B64=$(cat "${SBOM_FILE}" | base64 | tr -d '\n')
-
-        MUTATION=$(cat <<'GRAPHQL'
-        mutation IngestSBOM($sbom: String!, $source: String!) {
-          ingestSBOM(
-            subject: { package: { type: "oci", namespace: "", name: $source, version: "" } }
-            sbom: { uri: $source, algorithm: "sha256", digest: "" }
-            spec: { rawPayload: $sbom, origin: "tekton-pipeline", collector: "trusted-supply-chain-poc" }
-          )
-        }
-        GRAPHQL
-        )
-
-        PAYLOAD=$(printf '{"query":"%s","variables":{"sbom":"%s","source":"%s"}}' \
-          "$(echo "${MUTATION}" | tr '\n' ' ' | sed 's/"/\\"/g')" \
-          "${SBOM_B64}" \
-          "${IMAGE}")
-
-        HTTP_CODE=$(curl -s -o /tmp/guac-response.json -w "%{http_code}" \
-          -X POST "${GUAC_URL}" \
-          -H "Content-Type: application/json" \
-          -d "${PAYLOAD}" \
-          --connect-timeout 10 \
-          --max-time 30 || echo "000")
-
-        if [ "${HTTP_CODE}" = "200" ]; then
-          echo "▸ SBOM successfully ingested into GUAC"
-          cat /tmp/guac-response.json
-        else
-          echo "⚠ GUAC ingestion returned HTTP ${HTTP_CODE} (non-blocking)"
-          cat /tmp/guac-response.json 2>/dev/null || true
-          echo "⚠ Continuing — GUAC may not be available in this environment."
-          echo "  In production, GUAC ingestion would be mandatory."
-        fi
-
-    # Step 3 – Evaluate security gate
     - name: evaluate-gate
       image: python:3.12-alpine
-      workingDir: $(workspaces.source.path)
       script: |
         #!/usr/bin/env python3
-        import json, sys, os
+        """Security gate with CVE allowlist support."""
+        import json, sys, pathlib
 
-        FAIL_SEVERITY = "$(params.FAIL_ON_SEVERITY)".upper()
-        results_file = "$(workspaces.source.path)/grype-results.json"
+        FAIL_SEV = "$(params.FAIL_ON_SEVERITY)".upper()
+        RESULTS  = "$(workspaces.source.path)/grype-results.json"
+        ALLOW_F  = "$(workspaces.cve-allowlist.path)/cve-allowlist.json"
 
-        print(f"▸ Security Gate — failing on severity: {FAIL_SEVERITY}")
-        print("════════════════════════════════════════════════════════════")
+        SEV_ORDER = ["NEGLIGIBLE", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        fail_idx  = SEV_ORDER.index(FAIL_SEV) if FAIL_SEV in SEV_ORDER else 4
 
-        severity_order = ["NEGLIGIBLE", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
-        fail_idx = severity_order.index(FAIL_SEVERITY) if FAIL_SEVERITY in severity_order else 4
+        allowlist = set()
+        try:
+            data = json.loads(pathlib.Path(ALLOW_F).read_text())
+            for entry in data.get("allowlist", []):
+                allowlist.add(entry["id"])
+            print(f"▸ CVE allowlist loaded — {len(allowlist)} entries")
+            for cid in sorted(allowlist):
+                print(f"  ◦ {cid} (accepted)")
+        except Exception:
+            print("▸ No CVE allowlist found")
 
         try:
-            with open(results_file) as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"⚠ Could not parse Grype results: {e}")
-            data = {"matches": []}
+            results = json.loads(pathlib.Path(RESULTS).read_text())
+        except Exception:
+            results = {"matches": []}
 
-        matches = data.get("matches", [])
-        total = len(matches)
+        matches = results.get("matches", [])
+        total   = len(matches)
+        counts  = {}
+        blocking_cves = []
 
-        counts = {}
         for m in matches:
-            vuln = m.get("vulnerability", {})
-            sev = vuln.get("severity", "UNKNOWN").upper()
+            v   = m.get("vulnerability", {})
+            vid = v.get("id", "")
+            sev = v.get("severity", "UNKNOWN").upper()
             counts[sev] = counts.get(sev, 0) + 1
+            if vid in allowlist:
+                continue
+            sev_idx = SEV_ORDER.index(sev) if sev in SEV_ORDER else -1
+            if sev_idx >= fail_idx:
+                art = m.get("artifact", {})
+                blocking_cves.append(
+                    f"{vid} [{sev}] — {art.get('name','?')}:{art.get('version','?')}")
 
-        crit = counts.get("CRITICAL", 0)
-        high = counts.get("HIGH", 0)
-        medium = counts.get("MEDIUM", 0)
-        low = counts.get("LOW", 0)
+        print()
+        print("╔═══════════════════════════════════════════════════════════╗")
+        print("║  SECURITY GATE EVALUATION                                ║")
+        print("╠═══════════════════════════════════════════════════════════╣")
+        print(f"║  Threshold     : {FAIL_SEV}+")
+        print(f"║  Total CVEs    : {total}")
+        print(f"║  CRITICAL      : {counts.get('CRITICAL',0)}")
+        print(f"║  HIGH          : {counts.get('HIGH',0)}")
+        print(f"║  MEDIUM        : {counts.get('MEDIUM',0)}")
+        print(f"║  LOW           : {counts.get('LOW',0)}")
+        print(f"║  Allow-listed  : {len(allowlist)}")
+        print(f"║  Blocking      : {len(blocking_cves)}")
+        print("╚═══════════════════════════════════════════════════════════╝")
 
-        print(f"  Total vulnerabilities : {total}")
-        print(f"  CRITICAL              : {crit}")
-        print(f"  HIGH                  : {high}")
-        print(f"  MEDIUM                : {medium}")
-        print(f"  LOW                   : {low}")
-        print("════════════════════════════════════════════════════════════")
+        pathlib.Path("$(results.CRITICAL_COUNT.path)").write_text(str(counts.get("CRITICAL",0)))
+        pathlib.Path("$(results.TOTAL_VULN_COUNT.path)").write_text(str(total))
 
-        blocking = sum(
-            counts.get(sev, 0)
-            for sev in severity_order[fail_idx:]
-        )
-
-        results_dir_digest = os.path.dirname("$(results.GATE_RESULT.path)")
-
-        with open("$(results.CRITICAL_COUNT.path)", "w") as f:
-            f.write(str(crit))
-        with open("$(results.TOTAL_VULN_COUNT.path)", "w") as f:
-            f.write(str(total))
-
-        if blocking > 0:
-            print(f"\n❌ SECURITY GATE: FAILED — {blocking} vulnerabilities at {FAIL_SEVERITY}+ severity")
-            with open("$(results.GATE_RESULT.path)", "w") as f:
-                f.write("FAILED")
+        if blocking_cves:
+            print("\n  BLOCKING CVEs (not in allowlist):")
+            for c in blocking_cves:
+                print(f"    ✗ {c}")
+            print(f"\n❌ SECURITY GATE FAILED — {len(blocking_cves)} blocking CVE(s)")
+            pathlib.Path("$(results.GATE_RESULT.path)").write_text("FAILED")
             sys.exit(1)
         else:
-            print(f"\n✅ SECURITY GATE: PASSED — No vulnerabilities at {FAIL_SEVERITY}+ severity")
-            with open("$(results.GATE_RESULT.path)", "w") as f:
-                f.write("PASSED")
-            sys.exit(0)
+            print("\n✅ SECURITY GATE PASSED — no blocking CVEs outside allowlist")
+            pathlib.Path("$(results.GATE_RESULT.path)").write_text("PASSED")

@@ -9,8 +9,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "${SCRIPT_DIR}")"
 KEYS_DIR="${ROOT_DIR}/.keys"
+ENV_FILE="${ROOT_DIR}/.env"
 
 NAMESPACE="trusted-supply-chain"
+
+# ── Load credentials from .env ───────────────────────────────────
+if [ -f "${ENV_FILE}" ]; then
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  echo "  ℹ  Loaded credentials from ${ENV_FILE}"
+fi
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  Trusted Supply Chain PoC — Credential Setup                ║"
@@ -47,8 +55,10 @@ echo ""
 echo "▸ [3/3] Creating Kubernetes secret: quay-registry-secret"
 echo ""
 
+QUAY_PASSWORD="${QUAY_SECRET:-${QUAY_PASSWORD:-}}"
+
 if [ -z "${QUAY_USERNAME:-}" ] || [ -z "${QUAY_PASSWORD:-}" ]; then
-  echo "  ℹ  Set QUAY_USERNAME and QUAY_PASSWORD environment variables"
+  echo "  ℹ  Set QUAY_USERNAME and QUAY_SECRET in .env (project root)"
   echo "     or enter them interactively below."
   echo ""
   if [ -z "${QUAY_USERNAME:-}" ]; then
