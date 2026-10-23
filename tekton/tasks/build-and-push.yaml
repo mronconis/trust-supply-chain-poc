@@ -1,0 +1,89 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-and-push
+  namespace: trusted-supply-chain
+  labels:
+    app.kubernetes.io/part-of: trusted-supply-chain
+spec:
+  description: |
+    Clones the Quarkus source, builds the container image with Buildah,
+    and pushes it to Quay.io.
+  params:
+    - name: IMAGE
+      description: Full image reference (e.g. quay.io/mronconi/trusted-supply-chain-app:latest)
+      type: string
+    - name: GIT_URL
+      description: Git repository URL
+      type: string
+      default: "https://github.com/mronconi/trust-supply-chain-poc.git"
+    - name: GIT_REVISION
+      description: Git revision to checkout
+      type: string
+      default: "main"
+    - name: CONTEXT
+      description: Path to the Dockerfile context within the repo
+      type: string
+      default: "quarkus-app"
+  workspaces:
+    - name: source
+      description: Workspace for cloning and building
+    - name: dockerconfig
+      description: Docker config.json for registry auth
+  results:
+    - name: IMAGE_DIGEST
+      description: Digest of the built image
+    - name: IMAGE_URL
+      description: Full image URL with digest
+  steps:
+    # Step 1 – Clone
+    - name: git-clone
+      image: alpine/git:2.43.0
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "▸ Cloning $(params.GIT_URL) @ $(params.GIT_REVISION)"
+        rm -rf source && mkdir source
+        cd source
+        git init
+        git remote add origin "$(params.GIT_URL)"
+        git fetch --depth 1 origin "$(params.GIT_REVISION)"
+        git checkout FETCH_HEAD
+        echo "▸ Clone complete"
+        ls -la
+
+    # Step 2 – Build & Push with Buildah
+    - name: buildah-build-push
+      image: quay.io/buildah/stable:v1.37
+      workingDir: $(workspaces.source.path)/source/$(params.CONTEXT)
+      securityContext:
+        privileged: true
+      env:
+        - name: DOCKER_CONFIG
+          value: $(workspaces.dockerconfig.path)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        IMAGE="$(params.IMAGE)"
+        echo "▸ Building image ${IMAGE}"
+
+        buildah bud \
+          --format oci \
+          --tls-verify=true \
+          --layers \
+          -f Dockerfile \
+          -t "${IMAGE}" .
+
+        echo "▸ Pushing image to registry"
+        buildah push \
+          --tls-verify=true \
+          --authfile "${DOCKER_CONFIG}/.dockerconfigjson" \
+          --digestfile /tmp/image-digest \
+          "${IMAGE}" \
+          "docker://${IMAGE}"
+
+        DIGEST=$(cat /tmp/image-digest)
+        echo "▸ Image pushed with digest: ${DIGEST}"
+        printf "%s" "${DIGEST}"        > $(results.IMAGE_DIGEST.path)
+        printf "%s@%s" "${IMAGE}" "${DIGEST}" > $(results.IMAGE_URL.path)

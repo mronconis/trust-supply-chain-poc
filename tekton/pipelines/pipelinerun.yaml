@@ -1,0 +1,39 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: trusted-supply-chain-run-
+  namespace: trusted-supply-chain
+  labels:
+    app.kubernetes.io/part-of: trusted-supply-chain
+    tekton.dev/pipeline: trusted-supply-chain
+spec:
+  pipelineRef:
+    name: trusted-supply-chain
+  params:
+    - name: IMAGE
+      value: "quay.io/mronconi/trusted-supply-chain-app:latest"
+    - name: GIT_URL
+      value: "https://github.com/mronconi/trust-supply-chain-poc.git"
+    - name: GIT_REVISION
+      value: "main"
+    - name: FAIL_ON_SEVERITY
+      value: "critical"
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+    - name: dockerconfig
+      secret:
+        secretName: quay-registry-secret
+    - name: cosign-keys
+      secret:
+        secretName: cosign-keys
+  taskRunTemplate:
+    podTemplate:
+      securityContext:
+        fsGroup: 65532

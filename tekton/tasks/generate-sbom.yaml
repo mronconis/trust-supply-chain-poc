@@ -1,0 +1,84 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: generate-sbom
+  namespace: trusted-supply-chain
+  labels:
+    app.kubernetes.io/part-of: trusted-supply-chain
+spec:
+  description: |
+    Generates a CycloneDX SBOM from the built container image using Syft,
+    then attaches it to the OCI image as a cosign attestation.
+  params:
+    - name: IMAGE
+      description: Full image reference
+      type: string
+    - name: IMAGE_DIGEST
+      description: Image digest from build step
+      type: string
+  workspaces:
+    - name: source
+      description: Workspace with source code
+    - name: cosign-keys
+      description: Cosign private key for attesting
+    - name: dockerconfig
+      description: Docker config.json for registry auth
+  results:
+    - name: SBOM_PATH
+      description: Path to the generated SBOM file
+    - name: SBOM_COMPONENT_COUNT
+      description: Number of components in the SBOM
+  steps:
+    # Step 1 – Generate SBOM with Syft
+    - name: syft-generate
+      image: anchore/syft:v1.9.0
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: DOCKER_CONFIG
+          value: $(workspaces.dockerconfig.path)
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        IMAGE="$(params.IMAGE)"
+        echo "▸ Generating CycloneDX SBOM for ${IMAGE}"
+
+        syft "registry:${IMAGE}" \
+          -o cyclonedx-json \
+          --file /tmp/sbom-cyclonedx.json
+
+        COMPONENTS=$(cat /tmp/sbom-cyclonedx.json | \
+          python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('components',[])))" 2>/dev/null || echo "N/A")
+
+        echo "▸ SBOM generated — ${COMPONENTS} components detected"
+        cp /tmp/sbom-cyclonedx.json $(workspaces.source.path)/sbom-cyclonedx.json
+        printf "%s" "$(workspaces.source.path)/sbom-cyclonedx.json" > $(results.SBOM_PATH.path)
+        printf "%s" "${COMPONENTS}" > $(results.SBOM_COMPONENT_COUNT.path)
+
+    # Step 2 – Attach SBOM as cosign attestation
+    - name: cosign-attest-sbom
+      image: bitnami/cosign:2.4.0
+      workingDir: $(workspaces.source.path)
+      env:
+        - name: DOCKER_CONFIG
+          value: $(workspaces.dockerconfig.path)
+        - name: COSIGN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cosign-keys
+              key: password
+              optional: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        IMAGE="$(params.IMAGE)@$(params.IMAGE_DIGEST)"
+        SBOM_FILE="$(workspaces.source.path)/sbom-cyclonedx.json"
+        KEY_FILE="$(workspaces.cosign-keys.path)/cosign.key"
+
+        echo "▸ Attesting SBOM to ${IMAGE}"
+        cosign attest \
+          --key "${KEY_FILE}" \
+          --type cyclonedx \
+          --predicate "${SBOM_FILE}" \
+          --yes \
+          "${IMAGE}"
+        echo "▸ SBOM attestation attached"

@@ -1,0 +1,23 @@
+# Keys — NEVER commit private keys
+.keys/
+
+# Java / Maven
+quarkus-app/target/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tekton runs (local debug artifacts)
+*.pipelinerun.yaml

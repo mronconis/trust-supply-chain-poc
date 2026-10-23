@@ -1,0 +1,78 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: cosign-sign
+  namespace: trusted-supply-chain
+  labels:
+    app.kubernetes.io/part-of: trusted-supply-chain
+spec:
+  description: |
+    Signs the OCI container image using Cosign with a static local keypair.
+    This is the upstream equivalent of Red Hat Trusted Artifact Signer (TAS).
+  params:
+    - name: IMAGE
+      description: Full image reference
+      type: string
+    - name: IMAGE_DIGEST
+      description: Image digest
+      type: string
+  workspaces:
+    - name: cosign-keys
+      description: Workspace with cosign.key and cosign.pub
+    - name: dockerconfig
+      description: Docker config.json for registry auth
+  results:
+    - name: SIGNED_IMAGE
+      description: Signed image reference with digest
+  steps:
+    - name: cosign-sign
+      image: bitnami/cosign:2.4.0
+      env:
+        - name: DOCKER_CONFIG
+          value: $(workspaces.dockerconfig.path)
+        - name: COSIGN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cosign-keys
+              key: password
+              optional: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        IMAGE="$(params.IMAGE)@$(params.IMAGE_DIGEST)"
+        KEY_FILE="$(workspaces.cosign-keys.path)/cosign.key"
+
+        echo "════════════════════════════════════════════════════════════"
+        echo "  COSIGN SIGNING"
+        echo "════════════════════════════════════════════════════════════"
+        echo "  Image  : ${IMAGE}"
+        echo "  Key    : ${KEY_FILE}"
+        echo "════════════════════════════════════════════════════════════"
+
+        cosign sign \
+          --key "${KEY_FILE}" \
+          --yes \
+          "${IMAGE}"
+
+        echo ""
+        echo "✅ Image signed successfully"
+        printf "%s" "${IMAGE}" > $(results.SIGNED_IMAGE.path)
+
+    - name: verify-signature
+      image: bitnami/cosign:2.4.0
+      env:
+        - name: DOCKER_CONFIG
+          value: $(workspaces.dockerconfig.path)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        IMAGE="$(params.IMAGE)@$(params.IMAGE_DIGEST)"
+        PUB_FILE="$(workspaces.cosign-keys.path)/cosign.pub"
+
+        echo "▸ Verifying signature immediately after signing..."
+        cosign verify \
+          --key "${PUB_FILE}" \
+          "${IMAGE}"
+
+        echo ""
+        echo "✅ Signature verification passed — the chain of trust is complete"
