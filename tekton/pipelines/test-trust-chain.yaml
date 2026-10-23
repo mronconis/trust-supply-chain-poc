@@ -5,11 +5,10 @@ metadata:
   namespace: trusted-supply-chain
   labels:
     app.kubernetes.io/part-of: trusted-supply-chain
-  annotations:
-    description: |
-      Test pipeline: SBOM → Security Gate → Sign & Verify.
-      Uses a pre-built image to test the trust chain logic.
 spec:
+  description: >
+    Trusted Supply Chain pipeline — SBOM generation, vulnerability scanning
+    with CVE allowlist, GUAC ingestion, security gate, and Cosign signing.
   params:
     - name: IMAGE
       type: string
@@ -22,20 +21,19 @@ spec:
     - name: shared-workspace
     - name: cosign-keys
     - name: dockerconfig
+    - name: cve-allowlist
 
   tasks:
-    # ── Stage 1: SBOM Generation ──
+    # ═══════════════════════════════════════════════════════════
+    # Stage 1 — Generate SBOM (file only, no attestation yet)
+    # ═══════════════════════════════════════════════════════════
     - name: generate-sbom
       taskSpec:
         params:
           - name: IMAGE
             type: string
-          - name: IMAGE_DIGEST
-            type: string
         workspaces:
           - name: source
-          - name: cosign-keys
-          - name: dockerconfig
         results:
           - name: SBOM_COMPONENT_COUNT
         steps:
@@ -50,50 +48,23 @@ spec:
               echo "▸ Generating CycloneDX SBOM for ${IMAGE}"
               SYFT_REGISTRY_INSECURE_USE_HTTP=true \
               SYFT_REGISTRY_INSECURE_SKIP_TLS_VERIFY=true \
-              syft "registry:${IMAGE}" \
-                -o cyclonedx-json=$(workspaces.source.path)/sbom-cyclonedx.json
+                syft "registry:${IMAGE}" \
+                  -o cyclonedx-json=$(workspaces.source.path)/sbom-cyclonedx.json
               COMPONENTS=$(grep -c '"bom-ref"' $(workspaces.source.path)/sbom-cyclonedx.json || echo "0")
-              echo "▸ SBOM generated — ${COMPONENTS} components"
+              echo "▸ SBOM generated — ${COMPONENTS} components detected"
               printf "%s" "${COMPONENTS}" > $(results.SBOM_COMPONENT_COUNT.path)
-
-          - name: cosign-attest-sbom
-            image: bitnami/cosign:latest
-            env:
-              - name: COSIGN_PASSWORD
-                value: ""
-            script: |
-              #!/bin/bash
-              set -euo pipefail
-              IMAGE="$(params.IMAGE)@$(params.IMAGE_DIGEST)"
-              SBOM_FILE="$(workspaces.source.path)/sbom-cyclonedx.json"
-              KEY_FILE="$(workspaces.cosign-keys.path)/cosign.key"
-              echo "▸ Attesting SBOM to ${IMAGE}"
-              cosign attest \
-                --key "${KEY_FILE}" \
-                --type cyclonedx \
-                --predicate "${SBOM_FILE}" \
-                --allow-insecure-registry \
-                --allow-http-registry \
-                --yes \
-                "${IMAGE}"
-              echo "▸ SBOM attestation attached ✅"
       params:
         - name: IMAGE
           value: $(params.IMAGE)
-        - name: IMAGE_DIGEST
-          value: $(params.IMAGE_DIGEST)
       workspaces:
         - name: source
           workspace: shared-workspace
-        - name: cosign-keys
-          workspace: cosign-keys
-        - name: dockerconfig
-          workspace: dockerconfig
 
-    # ── Stage 2: Security Gate ──
+    # ═══════════════════════════════════════════════════════════
+    # Stage 2 — Vulnerability scan + GUAC ingest + security gate
+    # ═══════════════════════════════════════════════════════════
     - name: security-gate
-      runAfter:
-        - generate-sbom
+      runAfter: [generate-sbom]
       taskSpec:
         params:
           - name: IMAGE
@@ -103,6 +74,7 @@ spec:
         workspaces:
           - name: source
           - name: dockerconfig
+          - name: cve-allowlist
         results:
           - name: GATE_RESULT
           - name: CRITICAL_COUNT
@@ -116,91 +88,108 @@ spec:
               echo "▸ Installing Grype..."
               wget -qO- https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
               SBOM_FILE="$(workspaces.source.path)/sbom-cyclonedx.json"
-              echo "▸ Running Grype vulnerability scan"
-              grype sbom:"${SBOM_FILE}" \
-                -o json --file $(workspaces.source.path)/grype-results.json || true
+              echo "▸ Scanning SBOM for vulnerabilities"
+              grype sbom:"${SBOM_FILE}" -o json --file $(workspaces.source.path)/grype-results.json || true
               echo ""
-              echo "═══════════════════════════════════════════"
-              echo "  VULNERABILITY TABLE"
-              echo "═══════════════════════════════════════════"
+              echo "╔═══════════════════════════════════════════════════════════╗"
+              echo "║  VULNERABILITY SCAN RESULTS                              ║"
+              echo "╚═══════════════════════════════════════════════════════════╝"
               grype sbom:"${SBOM_FILE}" -o table || true
-              echo "═══════════════════════════════════════════"
 
           - name: guac-ingest
             image: curlimages/curl:8.9.1
             script: |
               #!/bin/sh
               set -eu
-              GUAC_URL="http://guac-graphql.trusted-supply-chain.svc:8080/query"
-              echo "▸ Verifying GUAC connectivity at ${GUAC_URL}"
-              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                -X POST "${GUAC_URL}" \
+              GUAC="http://guac-graphql.trusted-supply-chain.svc:8080/query"
+              echo "▸ Verifying GUAC at ${GUAC}"
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${GUAC}" \
                 -H "Content-Type: application/json" \
                 -d '{"query":"{ packages(pkgSpec: {}) { type } }"}' \
                 --connect-timeout 5 --max-time 10 || echo "000")
-              if [ "${HTTP_CODE}" = "200" ]; then
-                echo "✅ GUAC reachable — HTTP ${HTTP_CODE}"
-              else
-                echo "⚠ GUAC returned HTTP ${HTTP_CODE} (non-blocking)"
-              fi
+              [ "${CODE}" = "200" ] && echo "✅ GUAC reachable" || echo "⚠ GUAC HTTP ${CODE} (non-blocking)"
 
           - name: evaluate-gate
             image: python:3.12-alpine
             script: |
               #!/usr/bin/env python3
-              import json, sys
+              """Security gate with CVE allowlist support."""
+              import json, sys, pathlib
 
-              FAIL_SEVERITY = "$(params.FAIL_ON_SEVERITY)".upper()
-              results_file = "$(workspaces.source.path)/grype-results.json"
+              FAIL_SEV = "$(params.FAIL_ON_SEVERITY)".upper()
+              RESULTS  = "$(workspaces.source.path)/grype-results.json"
+              ALLOW_F  = "$(workspaces.cve-allowlist.path)/cve-allowlist.json"
 
-              print(f"▸ Security Gate — failing on: {FAIL_SEVERITY}+")
-              print("═" * 60)
+              SEV_ORDER = ["NEGLIGIBLE", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+              fail_idx  = SEV_ORDER.index(FAIL_SEV) if FAIL_SEV in SEV_ORDER else 4
 
-              severity_order = ["NEGLIGIBLE", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
-              fail_idx = severity_order.index(FAIL_SEVERITY) if FAIL_SEVERITY in severity_order else 4
+              allowlist = set()
+              try:
+                  data = json.loads(pathlib.Path(ALLOW_F).read_text())
+                  for entry in data.get("allowlist", []):
+                      allowlist.add(entry["id"])
+                  print(f"▸ CVE allowlist loaded — {len(allowlist)} entries")
+                  for cid in sorted(allowlist):
+                      print(f"  ◦ {cid} (accepted)")
+              except Exception:
+                  print("▸ No CVE allowlist found — all CVEs will be evaluated")
 
               try:
-                  with open(results_file) as f:
-                      data = json.load(f)
-              except Exception as e:
-                  print(f"⚠ Could not parse Grype results: {e}")
-                  data = {"matches": []}
+                  results = json.loads(pathlib.Path(RESULTS).read_text())
+              except Exception:
+                  results = {"matches": []}
 
-              matches = data.get("matches", [])
-              total = len(matches)
+              matches = results.get("matches", [])
+              total   = len(matches)
+
               counts = {}
+              blocking_cves = []
               for m in matches:
-                  sev = m.get("vulnerability", {}).get("severity", "UNKNOWN").upper()
+                  v   = m.get("vulnerability", {})
+                  vid = v.get("id", "")
+                  sev = v.get("severity", "UNKNOWN").upper()
                   counts[sev] = counts.get(sev, 0) + 1
 
+                  if vid in allowlist:
+                      continue
+                  sev_idx = SEV_ORDER.index(sev) if sev in SEV_ORDER else -1
+                  if sev_idx >= fail_idx:
+                      art = m.get("artifact", {})
+                      blocking_cves.append(
+                          f"{vid} [{sev}] — {art.get('name','?')}:{art.get('version','?')}"
+                      )
+
+              print()
+              print("╔═══════════════════════════════════════════════════════════╗")
+              print("║  SECURITY GATE EVALUATION                                ║")
+              print("╠═══════════════════════════════════════════════════════════╣")
+              print(f"║  Threshold     : {FAIL_SEV}+")
+              print(f"║  Total CVEs    : {total}")
+              print(f"║  CRITICAL      : {counts.get('CRITICAL',0)}")
+              print(f"║  HIGH          : {counts.get('HIGH',0)}")
+              print(f"║  MEDIUM        : {counts.get('MEDIUM',0)}")
+              print(f"║  LOW           : {counts.get('LOW',0)}")
+              print(f"║  Allow-listed  : {len(allowlist)}")
+              print(f"║  Blocking      : {len(blocking_cves)}")
+              print("╚═══════════════════════════════════════════════════════════╝")
+
               crit = counts.get("CRITICAL", 0)
-              high = counts.get("HIGH", 0)
-              medium = counts.get("MEDIUM", 0)
-              low = counts.get("LOW", 0)
+              pathlib.Path("$(results.CRITICAL_COUNT.path)").write_text(str(crit))
+              pathlib.Path("$(results.TOTAL_VULN_COUNT.path)").write_text(str(total))
 
-              print(f"  Total vulnerabilities : {total}")
-              print(f"  CRITICAL              : {crit}")
-              print(f"  HIGH                  : {high}")
-              print(f"  MEDIUM                : {medium}")
-              print(f"  LOW                   : {low}")
-              print("═" * 60)
-
-              blocking = sum(counts.get(s, 0) for s in severity_order[fail_idx:])
-
-              with open("$(results.CRITICAL_COUNT.path)", "w") as f:
-                  f.write(str(crit))
-              with open("$(results.TOTAL_VULN_COUNT.path)", "w") as f:
-                  f.write(str(total))
-
-              if blocking > 0:
-                  print(f"\n❌ SECURITY GATE: FAILED — {blocking} vulns at {FAIL_SEVERITY}+")
-                  with open("$(results.GATE_RESULT.path)", "w") as f:
-                      f.write("FAILED")
+              if blocking_cves:
+                  print()
+                  print("  BLOCKING CVEs (not in allowlist):")
+                  for c in blocking_cves:
+                      print(f"    ✗ {c}")
+                  print()
+                  print(f"❌ SECURITY GATE FAILED — {len(blocking_cves)} blocking CVE(s)")
+                  pathlib.Path("$(results.GATE_RESULT.path)").write_text("FAILED")
                   sys.exit(1)
               else:
-                  print(f"\n✅ SECURITY GATE: PASSED — No vulns at {FAIL_SEVERITY}+")
-                  with open("$(results.GATE_RESULT.path)", "w") as f:
-                      f.write("PASSED")
+                  print()
+                  print("✅ SECURITY GATE PASSED — no blocking CVEs outside allowlist")
+                  pathlib.Path("$(results.GATE_RESULT.path)").write_text("PASSED")
       params:
         - name: IMAGE
           value: $(params.IMAGE)
@@ -211,11 +200,14 @@ spec:
           workspace: shared-workspace
         - name: dockerconfig
           workspace: dockerconfig
+        - name: cve-allowlist
+          workspace: cve-allowlist
 
-    # ── Stage 3: Sign & Verify ──
-    - name: cosign-sign
-      runAfter:
-        - security-gate
+    # ═══════════════════════════════════════════════════════════
+    # Stage 3 — Attest SBOM + Sign + Verify (only if gate passed)
+    # ═══════════════════════════════════════════════════════════
+    - name: sign-and-attest
+      runAfter: [security-gate]
       taskSpec:
         params:
           - name: IMAGE
@@ -223,11 +215,30 @@ spec:
           - name: IMAGE_DIGEST
             type: string
         workspaces:
+          - name: source
           - name: cosign-keys
           - name: dockerconfig
         results:
           - name: SIGNED_IMAGE
         steps:
+          - name: cosign-attest-sbom
+            image: bitnami/cosign:latest
+            env:
+              - name: COSIGN_PASSWORD
+                value: ""
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+              IMAGE="$(params.IMAGE)@$(params.IMAGE_DIGEST)"
+              echo "▸ Attesting SBOM to ${IMAGE}"
+              cosign attest \
+                --key "$(workspaces.cosign-keys.path)/cosign.key" \
+                --type cyclonedx \
+                --predicate "$(workspaces.source.path)/sbom-cyclonedx.json" \
+                --allow-insecure-registry --allow-http-registry --yes \
+                "${IMAGE}"
+              echo "✅ SBOM attestation attached"
+
           - name: cosign-sign
             image: bitnami/cosign:latest
             env:
@@ -237,60 +248,58 @@ spec:
               #!/bin/bash
               set -euo pipefail
               IMAGE="$(params.IMAGE)@$(params.IMAGE_DIGEST)"
-              KEY_FILE="$(workspaces.cosign-keys.path)/cosign.key"
-              echo "════════════════════════════════════════════"
-              echo "  COSIGN SIGNING"
-              echo "  Image: ${IMAGE}"
-              echo "════════════════════════════════════════════"
+              echo "╔═══════════════════════════════════════════════════════════╗"
+              echo "║  COSIGN SIGN                                             ║"
+              echo "╠═══════════════════════════════════════════════════════════╣"
+              echo "║  Image : ${IMAGE}"
+              echo "╚═══════════════════════════════════════════════════════════╝"
               cosign sign \
-                --key "${KEY_FILE}" \
-                --allow-insecure-registry \
-                --allow-http-registry \
-                --yes \
+                --key "$(workspaces.cosign-keys.path)/cosign.key" \
+                --allow-insecure-registry --allow-http-registry --yes \
                 "${IMAGE}"
-              echo ""
               echo "✅ Image signed successfully"
               printf "%s" "${IMAGE}" > $(results.SIGNED_IMAGE.path)
 
-          - name: verify-signature
+          - name: cosign-verify
             image: bitnami/cosign:latest
             script: |
               #!/bin/bash
               set -euo pipefail
-              PUB_FILE="$(workspaces.cosign-keys.path)/cosign.pub"
               echo "▸ Verifying signature with public key..."
               cosign verify \
-                --key "${PUB_FILE}" \
-                --allow-insecure-registry \
-                --allow-http-registry \
+                --key "$(workspaces.cosign-keys.path)/cosign.pub" \
+                --allow-insecure-registry --allow-http-registry \
                 --insecure-ignore-tlog \
                 "$(params.IMAGE)"
               echo ""
-              echo "✅ Signature verification PASSED — chain of trust intact"
+              echo "✅ Signature verified — the chain of trust is intact"
       params:
         - name: IMAGE
           value: $(params.IMAGE)
         - name: IMAGE_DIGEST
           value: $(params.IMAGE_DIGEST)
       workspaces:
+        - name: source
+          workspace: shared-workspace
         - name: cosign-keys
           workspace: cosign-keys
         - name: dockerconfig
           workspace: dockerconfig
 
   finally:
-    - name: summary
+    - name: pipeline-summary
       taskSpec:
         steps:
-          - name: print-summary
+          - name: summary
             image: alpine:3.20
             script: |
               #!/bin/sh
-              echo ""
-              echo "╔═══════════════════════════════════════════════════════╗"
-              echo "║  TRUSTED SUPPLY CHAIN — PIPELINE SUMMARY             ║"
-              echo "╠═══════════════════════════════════════════════════════╣"
-              echo "║  Image : $(params.IMAGE)"
-              echo "║  Gate  : Fail on $(params.FAIL_ON_SEVERITY)+"
-              echo "║  If any task failed, the image was NOT signed.       ║"
-              echo "╚═══════════════════════════════════════════════════════╝"
+              cat <<'EOF'
+
+              ╔═══════════════════════════════════════════════════════════╗
+              ║      TRUSTED SUPPLY CHAIN — PIPELINE COMPLETE           ║
+              ╠═══════════════════════════════════════════════════════════╣
+              ║  If any task failed, the image was NOT signed.          ║
+              ║  Run cosign verify to confirm trust status.             ║
+              ╚═══════════════════════════════════════════════════════════╝
+              EOF

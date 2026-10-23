@@ -21,3 +21,6 @@ Thumbs.db
 
 # Tekton runs (local debug artifacts)
 *.pipelinerun.yaml
+
+# Test output
+.test-output/
